@@ -3,13 +3,13 @@ import { useState, useRef, useEffect } from "react";
 import Sidebar from "@/components/Sidebar";
 
 const accepted = [".pdf", ".xlsx", ".xls", ".csv", ".docx", ".txt"];
-
 interface FileInfo { name: string; size: number; date: string; }
 
 export default function Upload() {
   const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [saved, setSaved] = useState<FileInfo[]>([]);
+  const [deleting, setDeleting] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { fetchFiles(); }, []);
@@ -38,6 +38,13 @@ export default function Upload() {
     }
     setUploading(false);
     setFiles([]);
+    fetchFiles();
+  };
+
+  const handleDelete = async (name: string) => {
+    setDeleting(name);
+    await fetch(`/api/files/${encodeURIComponent(name)}`, { method: "DELETE" });
+    setDeleting(null);
     fetchFiles();
   };
 
@@ -132,6 +139,17 @@ export default function Upload() {
                   <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
                     {(f.size / 1024).toFixed(0)} KB · {new Date(f.date).toLocaleDateString("pt-BR")}
                   </span>
+                  <button
+                    onClick={() => handleDelete(f.name)}
+                    disabled={deleting === f.name}
+                    style={{
+                      padding: "6px 14px", background: "transparent",
+                      border: "1px solid var(--red)", borderRadius: 4,
+                      color: deleting === f.name ? "var(--text-3)" : "var(--red)",
+                      fontSize: 11, cursor: "pointer", fontFamily: "inherit",
+                      transition: "all 0.15s"
+                    }}
+                  >{deleting === f.name ? "Removendo..." : "Remover"}</button>
                 </div>
               ))}
             </div>

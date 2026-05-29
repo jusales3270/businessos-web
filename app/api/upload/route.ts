@@ -17,16 +17,18 @@ export async function POST(req: NextRequest) {
   const filepath = path.join(uploadDir, file.name);
   await writeFile(filepath, buffer);
 
-  // Send to Docling
   try {
-    const doclingRes = await fetch(DOCLING_URL, {
+    const blob = new Blob([buffer]);
+    const fd = new FormData();
+    fd.append("file", blob, file.name);
+
+    const doclingRes = await fetch(`${DOCLING_URL}/upload`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filepath })
+      body: fd
     });
     const docling = await doclingRes.json();
     return NextResponse.json({ ok: true, name: file.name, docling });
   } catch (e) {
-    return NextResponse.json({ ok: true, name: file.name, docling: { error: "Docling unreachable" } });
+    return NextResponse.json({ ok: true, name: file.name, docling: { error: String(e) } });
   }
 }

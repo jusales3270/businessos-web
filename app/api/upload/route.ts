@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
 
+const DOCLING_URL = "http://10.0.1.20:3002";
+
 export async function POST(req: NextRequest) {
   const formData = await req.formData();
   const file = formData.get("file") as File;
@@ -12,7 +14,19 @@ export async function POST(req: NextRequest) {
 
   const bytes = await file.arrayBuffer();
   const buffer = Buffer.from(bytes);
-  await writeFile(path.join(uploadDir, file.name), buffer);
+  const filepath = path.join(uploadDir, file.name);
+  await writeFile(filepath, buffer);
 
-  return NextResponse.json({ ok: true, name: file.name });
+  // Send to Docling
+  try {
+    const doclingRes = await fetch(DOCLING_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filepath })
+    });
+    const docling = await doclingRes.json();
+    return NextResponse.json({ ok: true, name: file.name, docling });
+  } catch (e) {
+    return NextResponse.json({ ok: true, name: file.name, docling: { error: "Docling unreachable" } });
+  }
 }

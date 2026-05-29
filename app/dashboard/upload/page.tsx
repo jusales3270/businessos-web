@@ -43,7 +43,7 @@ export default function Upload() {
 
   const handleDelete = async (name: string) => {
     setDeleting(name);
-    await fetch(`/api/files/${encodeURIComponent(name)}`, { method: "DELETE" });
+    await fetch(`/api/files?name=${encodeURIComponent(name)}`, { method: "DELETE" });
     setDeleting(null);
     fetchFiles();
   };
@@ -146,8 +146,7 @@ export default function Upload() {
                       padding: "6px 14px", background: "transparent",
                       border: "1px solid var(--red)", borderRadius: 4,
                       color: deleting === f.name ? "var(--text-3)" : "var(--red)",
-                      fontSize: 11, cursor: "pointer", fontFamily: "inherit",
-                      transition: "all 0.15s"
+                      fontSize: 11, cursor: "pointer", fontFamily: "inherit"
                     }}
                   >{deleting === f.name ? "Removendo..." : "Remover"}</button>
                 </div>

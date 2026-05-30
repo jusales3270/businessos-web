@@ -3,6 +3,56 @@ import { NextRequest, NextResponse } from "next/server";
 const DOCLING_URL = "http://docling:3002";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 
+// Palavras que indicam pergunta de contagem/agregacao — nesses casos
+// busca semantica nao basta, precisamos do documento inteiro.
+const AGG_HINTS = [
+  "quant", "total", "soma", "quantos", "quantas", "numero de", "número de",
+  "media", "média", "maior", "menor", "lista", "liste", "todos", "todas",
+  "por marca", "por modelo", "por tipo", "contagem", "conte",
+];
+
+function isAggregation(q: string): boolean {
+  const low = q.toLowerCase();
+  return AGG_HINTS.some((h) => low.includes(h));
+}
+
+async function getContext(question: string, department: string | null) {
+  // Pergunta de contagem -> le os documentos inteiros do departamento
+  if (isAggregation(question)) {
+    const listRes = await fetch(`${DOCLING_URL}/list`);
+    const listData = await listRes.json();
+    let files = listData.files || [];
+    if (department) files = files.filter((f: any) => f.department === department);
+
+    const parts: string[] = [];
+    const sources = new Set<string>();
+    for (const f of files.slice(0, 5)) {
+      const url = `${DOCLING_URL}/read?department=${encodeURIComponent(f.department)}&file=${encodeURIComponent(f.file)}`;
+      const r = await fetch(url);
+      const d = await r.json();
+      if (d.content) {
+        parts.push(`[Documento completo — ${f.file} (${f.department})]\n${d.content}`);
+        sources.add(`${f.file} (${f.department})`);
+      }
+    }
+    return { context: parts.join("\n\n"), sources: Array.from(sources) };
+  }
+
+  // Pergunta normal -> busca semantica (12 trechos)
+  const searchRes = await fetch(`${DOCLING_URL}/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: question, department: department || null, match_count: 12 }),
+  });
+  const searchData = await searchRes.json();
+  const results = searchData.results || [];
+  const context = results
+    .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
+    .join("\n\n");
+  const sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
+  return { context, sources };
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { question, department } = await req.json();
@@ -10,39 +60,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "question required" }, { status: 400 });
     }
 
-    // 1. Busca semantica no pgvector (via Docling /search — embedding OpenAI)
-    const searchRes = await fetch(`${DOCLING_URL}/search`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        query: question,
-        department: department || null,
-        match_count: 6,
-      }),
-    });
-    const searchData = await searchRes.json();
-    const results = searchData.results || [];
+    const { context, sources } = await getContext(question, department || null);
 
-    if (results.length === 0) {
+    if (!context) {
       return NextResponse.json({
-        answer: "Não encontrei nenhum documento na base de conhecimento que responda a essa pergunta. Verifique se o arquivo relevante foi enviado pelo dashboard.",
+        answer: "Não encontrei documentos na base de conhecimento para responder. Verifique se o arquivo foi enviado pelo dashboard.",
         sources: [],
       });
     }
 
-    // 2. Monta o contexto a partir dos trechos recuperados
-    const context = results
-      .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
-      .join("\n\n");
+    const prompt = `Você é a Sara, analista de dados do negócio. Responda à pergunta usando APENAS o conteúdo abaixo, extraído dos documentos reais da empresa. Seja direta e cite números concretos. Quando a pergunta for de contagem, CONTE cuidadosamente os itens listados. Se o conteúdo não permitir responder, diga que não há dado suficiente. Não invente.
 
-    const sources = Array.from(
-      new Set(results.map((r: any) => `${r.source_file} (${r.department})`))
-    );
-
-    // 3. Gera a resposta com DeepSeek via OpenRouter
-    const prompt = `Você é a Sara, analista de dados do negócio. Responda à pergunta usando APENAS os trechos abaixo, extraídos dos documentos reais da empresa. Seja direta e cite números concretos. Se os trechos não contiverem a resposta, diga que não há dado suficiente. Não invente.
-
-TRECHOS DA BASE DE CONHECIMENTO:
+CONTEÚDO DA BASE DE CONHECIMENTO:
 ${context}
 
 PERGUNTA: ${question}

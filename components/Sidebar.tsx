@@ -4,6 +4,7 @@ import { usePathname } from "next/navigation";
 
 const items = [
   { label: "Visão Geral", path: "/dashboard", icon: "◈" },
+  { label: "Consulta de Dados", path: "/dashboard/chat", icon: "✦" },
   { label: "Arquivos", path: "/dashboard/upload", icon: "⬡" },
   { label: "Alertas", path: "/dashboard/alertas", icon: "◉" },
   { label: "Relatórios", path: "/dashboard/relatorios", icon: "▦" },

@@ -4,7 +4,6 @@ import { createClient } from "@/lib/supabase/server";
 const DOCLING_URL = "http://docling:3002";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 
-// Modelos: busca normal usa DeepSeek; contagem usa Gemini Flash Lite (rapido em contexto grande)
 const MODEL_SEARCH = "deepseek/deepseek-v4-flash";
 const MODEL_COUNT = "google/gemini-3.1-flash-lite";
 
@@ -19,33 +18,6 @@ function isAggregation(q: string): boolean {
   return AGG_HINTS.some((h) => low.includes(h));
 }
 
-// Comprime texto de planilha: remove formatacao redundante de tabela markdown
-function compress(text: string): string {
-  const lines = text
-    .split("\n")
-    .map((line) =>
-      line
-        .replace(/\s*\|\s*/g, "|")   // tira espacos ao redor dos pipes
-        .replace(/\|+/g, "|")          // colapsa pipes repetidos
-        .replace(/^\|/, "")            // pipe inicial
-        .replace(/\|$/, "")            // pipe final
-        .replace(/\s{2,}/g, " ")      // espacos multiplos
-        .trim()
-    )
-    .filter((line) => line && !/^[-|\s]+$/.test(line)); // remove linhas separadoras
-
-  // Remove linhas duplicadas (overlap entre chunks repete linhas)
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const line of lines) {
-    if (!seen.has(line)) {
-      seen.add(line);
-      unique.push(line);
-    }
-  }
-  return unique.join("\n");
-}
-
 async function semanticSearch(question: string, department: string | null, companyId: string) {
   const res = await fetch(`${DOCLING_URL}/search`, {
     method: "POST",
@@ -56,28 +28,25 @@ async function semanticSearch(question: string, department: string | null, compa
   return data.results || [];
 }
 
-async function allChunks(department: string | null, companyId: string) {
-  const res = await fetch(`${DOCLING_URL}/chunks`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ company_id: companyId, department: department || null }),
-  });
-  const data = await res.json();
-  return data.chunks || [];
-}
-
 async function askLLM(model: string, prompt: string) {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENROUTER_KEY}` },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-    }),
+    body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], temperature: 0.1 }),
   });
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "Erro ao gerar resposta.";
+}
+
+// Converte linhas estruturadas (jsonb) em texto tabular compacto, uma linha por registro
+function rowsToTable(rows: any[]): string {
+  if (rows.length === 0) return "";
+  const headers = Object.keys(rows[0].row_data);
+  const head = headers.join(" | ");
+  const body = rows
+    .map((r) => headers.map((h) => r.row_data[h] ?? "").join(" | "))
+    .join("\n");
+  return `${head}\n${body}`;
 }
 
 export async function POST(req: NextRequest) {
@@ -97,19 +66,37 @@ export async function POST(req: NextRequest) {
     if (!question) return NextResponse.json({ error: "question required" }, { status: 400 });
 
     const department = profile.role === "admin" ? (reqDept || null) : (profile.department || null);
+    const counting = isAggregation(question);
 
     let context = "";
     let sources: string[] = [];
     let model = MODEL_SEARCH;
-    const counting = isAggregation(question);
 
     if (counting) {
-      // Modo contagem: todos os chunks, comprimidos, modelo rapido
       model = MODEL_COUNT;
-      const chunks = await allChunks(department, profile.company_id);
-      if (chunks.length > 0) {
-        context = compress(chunks.map((c: any) => c.content).join("\n"));
-        sources = Array.from(new Set(chunks.map((c: any) => `${c.source_file} (${c.department})`)));
+      // Busca linhas estruturadas (sem duplicata) — RLS ja isola por empresa,
+      // mas filtramos tambem por company_id e department explicitamente.
+      let query = supabase
+        .from("sheet_rows")
+        .select("source_file, department, row_data, row_index")
+        .eq("company_id", profile.company_id)
+        .order("source_file", { ascending: true })
+        .order("row_index", { ascending: true });
+      if (department) query = query.eq("department", department);
+
+      const { data: rows } = await query;
+      if (rows && rows.length > 0) {
+        // agrupa por arquivo para montar tabelas separadas
+        const byFile: Record<string, any[]> = {};
+        for (const r of rows) {
+          (byFile[r.source_file] = byFile[r.source_file] || []).push(r);
+        }
+        const blocks: string[] = [];
+        for (const [file, frows] of Object.entries(byFile)) {
+          blocks.push(`### Planilha: ${file} (${frows.length} linhas)\n${rowsToTable(frows)}`);
+          sources.push(`${file} (${frows[0].department})`);
+        }
+        context = blocks.join("\n\n");
       }
     } else {
       const results = await semanticSearch(question, department, profile.company_id);
@@ -123,14 +110,23 @@ export async function POST(req: NextRequest) {
 
     if (!context) {
       return NextResponse.json({
-        answer: "Não encontrei documentos na base de conhecimento da sua empresa para responder. Verifique se o arquivo foi enviado pelo dashboard.",
+        answer: "Não encontrei dados na base da sua empresa para responder. Verifique se o arquivo foi enviado pelo dashboard.",
         sources: [],
       });
     }
 
-    const prompt = `Você é a Sara, analista de dados do negócio. Responda à pergunta usando APENAS o conteúdo abaixo, extraído dos documentos reais da empresa. Seja direta e cite números concretos. Quando a pergunta for de contagem, CONTE cuidadosamente os itens listados. Se o conteúdo não permitir responder, diga que não há dado suficiente. Não invente.
+    const prompt = counting
+      ? `Você é a Sara, analista de dados. Abaixo estão TODAS as linhas das planilhas da empresa, em formato tabular (uma linha = um registro, SEM duplicatas). Responda à pergunta CONTANDO ou somando exatamente as linhas que satisfazem o critério. Cada linha conta UMA vez. Seja exata e mostre o número. Se precisar agrupar (ex: por prefixo de código ou por categoria), faça com precisão.
 
-CONTEÚDO DA BASE DE CONHECIMENTO:
+DADOS:
+${context}
+
+PERGUNTA: ${question}
+
+RESPOSTA (com o número exato):`
+      : `Você é a Sara, analista de dados do negócio. Responda usando APENAS o conteúdo abaixo. Seja direta e cite a fonte. Se não houver dado suficiente, diga.
+
+CONTEÚDO:
 ${context}
 
 PERGUNTA: ${question}
@@ -138,7 +134,7 @@ PERGUNTA: ${question}
 RESPOSTA:`;
 
     const answer = await askLLM(model, prompt);
-    return NextResponse.json({ answer, sources });
+    return NextResponse.json({ answer, sources: Array.from(new Set(sources)) });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }

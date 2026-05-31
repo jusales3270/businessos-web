@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 const DOCLING_URL = "http://docling:3002";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 const MODEL = "deepseek/deepseek-v4-flash";
+const HISTORICO_N = 10; // ultimas mensagens carregadas como memoria
 
 const AGG_HINTS = [
   "quant", "total", "soma", "quantos", "quantas", "numero de", "número de",
@@ -15,13 +16,13 @@ function isAggregation(q: string): boolean {
   return AGG_HINTS.some((h) => low.includes(h));
 }
 
-async function askLLM(prompt: string, jsonMode = false): Promise<string> {
+async function askLLM(messages: any[], jsonMode = false): Promise<string> {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENROUTER_KEY}` },
     body: JSON.stringify({
       model: MODEL,
-      messages: [{ role: "user", content: prompt }],
+      messages,
       temperature: 0,
       ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     }),
@@ -30,7 +31,6 @@ async function askLLM(prompt: string, jsonMode = false): Promise<string> {
   return data.choices?.[0]?.message?.content || "";
 }
 
-// Aplica um filtro estruturado a uma linha. Operadores suportados.
 function matchFilter(value: string, operador: string, alvo: string): boolean {
   const v = (value ?? "").toString().toLowerCase().trim();
   const a = (alvo ?? "").toString().toLowerCase().trim();
@@ -63,9 +63,24 @@ export async function POST(req: NextRequest) {
 
     const department = profile.role === "admin" ? (reqDept || null) : (profile.department || null);
 
-    // ---------- CONTAGEM/AGREGACAO: text-to-filter + contagem em codigo ----------
+    // Grava a mensagem do usuario
+    await supabase.from("chat_messages").insert({
+      company_id: profile.company_id, user_id: user.id, role: "user", content: question,
+    });
+
+    // Carrega historico recente (memoria da conversa)
+    const { data: histRows } = await supabase
+      .from("chat_messages")
+      .select("role, content")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(HISTORICO_N);
+    const historico = (histRows || []).reverse(); // ordem cronologica
+
+    let answer = "";
+    let sources: string[] = [];
+
     if (isAggregation(question)) {
-      // Busca as linhas da empresa (RLS + filtro explicito)
       let query = supabase
         .from("sheet_rows")
         .select("source_file, department, row_data, row_index")
@@ -76,97 +91,83 @@ export async function POST(req: NextRequest) {
       const { data: rows } = await query;
 
       if (!rows || rows.length === 0) {
-        return NextResponse.json({
-          answer: "Não há planilhas estruturadas da sua empresa. Envie uma planilha pelo dashboard.",
-          sources: [],
-        });
-      }
+        answer = "Não há planilhas estruturadas da sua empresa. Envie uma planilha pelo dashboard.";
+      } else {
+        const colunas = Object.keys(rows[0].row_data);
+        sources = Array.from(new Set(rows.map((r: any) => `${r.source_file} (${r.department})`)));
 
-      const colunas = Object.keys(rows[0].row_data);
-      const sources = Array.from(new Set(rows.map((r: any) => `${r.source_file} (${r.department})`)));
-
-      // PASSO 1: LLM traduz a pergunta em filtros estruturados (nao conta)
-      const filterPrompt = `Você converte perguntas em filtros estruturados para contar linhas de uma planilha. NÃO conte nada, apenas gere o filtro.
+        // PASSO 1: LLM gera filtro OU pede esclarecimento (com memoria da conversa)
+        const sysFilter = `Você converte perguntas em filtros para contar linhas de uma planilha. NÃO conte.
 
 Colunas disponíveis: ${JSON.stringify(colunas)}
+Amostra de 3 linhas: ${rows.slice(0, 3).map((r: any) => JSON.stringify(r.row_data)).join(" ")}
+Operadores: "contem","igual","comeca_com","termina_com","diferente","nao_vazio".
+Regra de negócio: no código, prefixo TCNC=tornos, CV=centros verticais, CH=horizontais, CT=torneamento.
 
-Amostra de 3 linhas (para entender os valores):
-${rows.slice(0, 3).map((r: any) => JSON.stringify(r.row_data)).join("\n")}
+IMPORTANTE — AMBIGUIDADE: se o termo da pergunta puder se referir a MAIS DE UMA coluna (ex: "Mazak" pode ser o comando na coluna "Marca Comando" OU a marca da máquina em "Marca/Modelo"), NÃO escolha sozinho. Peça esclarecimento.
 
-Operadores válidos: "contem", "igual", "comeca_com", "termina_com", "diferente", "nao_vazio".
+Responda APENAS JSON:
+- Se claro: {"acao":"contar","filtros":[{"coluna":"...","operador":"...","valor":"..."}],"descricao":"..."}
+- Se ambíguo ou faltar info: {"acao":"esclarecer","pergunta":"sua pergunta curta ao usuário"}
+- Sem filtro (contar tudo): {"acao":"contar","filtros":[],"descricao":"total de itens"}`;
 
-Regra de negócio conhecida: na coluna de código, o prefixo indica o tipo — TCNC=tornos CNC, CV=centros verticais, CH=centros horizontais, CT=centros de torneamento.
+        const msgs = [
+          { role: "system", content: sysFilter },
+          ...historico.map((h) => ({ role: h.role, content: h.content })),
+        ];
+        let parsed: any = {};
+        try { parsed = JSON.parse(await askLLM(msgs, true)); } catch { parsed = { acao: "contar", filtros: [] }; }
 
-Pergunta: "${question}"
-
-Responda APENAS um JSON com este formato (sem texto extra):
-{"filtros":[{"coluna":"NOME_EXATO_DA_COLUNA","operador":"OPERADOR","valor":"VALOR"}],"descricao":"o que está sendo contado"}
-
-Se a pergunta pede contagem de tudo sem filtro, use "filtros":[]. Combine múltiplos filtros se necessário (todos devem bater - E lógico).`;
-
-      let filtros: any[] = [];
-      let descricao = "itens";
-      try {
-        const raw = await askLLM(filterPrompt, true);
-        const parsed = JSON.parse(raw);
-        filtros = Array.isArray(parsed.filtros) ? parsed.filtros : [];
-        descricao = parsed.descricao || "itens";
-      } catch {
-        filtros = [];
+        if (parsed.acao === "esclarecer" && parsed.pergunta) {
+          answer = parsed.pergunta; // a Sara devolve a pergunta de esclarecimento
+        } else {
+          const filtros = Array.isArray(parsed.filtros) ? parsed.filtros : [];
+          const descricao = parsed.descricao || "itens";
+          // PASSO 2: codigo conta (deterministico)
+          let contagem = 0;
+          for (const r of rows) {
+            const ok = filtros.every((f: any) => {
+              const val = r.row_data[f.coluna];
+              if (val === undefined) return false;
+              return matchFilter(String(val), f.operador, f.valor);
+            });
+            if (ok) contagem++;
+          }
+          // PASSO 3: LLM redige com o numero exato
+          const respMsgs = [
+            { role: "system", content: `Você é a Sara, analista de dados. O sistema já contou com exatidão (não recalcule). Pergunta: "${question}". Contado: ${descricao}. RESULTADO EXATO: ${contagem}. Total na base: ${rows.length}. Responda em uma frase curta usando exatamente ${contagem}.` },
+          ];
+          answer = await askLLM(respMsgs);
+        }
       }
-
-      // PASSO 2: codigo conta as linhas que batem com TODOS os filtros (deterministico)
-      let contagem = 0;
-      for (const r of rows) {
-        const ok = filtros.every((f) => {
-          const val = r.row_data[f.coluna];
-          if (val === undefined) return false;
-          return matchFilter(String(val), f.operador, f.valor);
-        });
-        if (ok) contagem++;
-      }
-
-      // PASSO 3: LLM apenas redige a resposta com o numero ja calculado
-      const respPrompt = `Você é a Sara, analista de dados. O sistema já contou com exatidão (não recalcule).
-
-Pergunta do usuário: "${question}"
-O que foi contado: ${descricao}
-RESULTADO EXATO calculado pelo sistema: ${contagem}
-Total de linhas na base: ${rows.length}
-
-Responda em uma frase curta e direta, usando exatamente o número ${contagem}.`;
-
-      const answer = await askLLM(respPrompt);
-      return NextResponse.json({ answer, sources, debug: { filtros, contagem } });
-    }
-
-    // ---------- BUSCA QUALITATIVA: RAG ----------
-    const sres = await fetch(`${DOCLING_URL}/search`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: question, department: department || null, company_id: profile.company_id, match_count: 12 }),
-    });
-    const sdata = await sres.json();
-    const results = sdata.results || [];
-    if (results.length === 0) {
-      return NextResponse.json({
-        answer: "Não encontrei dados na base da sua empresa para responder. Verifique se o arquivo foi enviado pelo dashboard.",
-        sources: [],
+    } else {
+      // BUSCA QUALITATIVA: RAG
+      const sres = await fetch(`${DOCLING_URL}/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: question, department: department || null, company_id: profile.company_id, match_count: 12 }),
       });
+      const sdata = await sres.json();
+      const results = sdata.results || [];
+      if (results.length === 0) {
+        answer = "Não encontrei dados na base da sua empresa para responder. Verifique se o arquivo foi enviado pelo dashboard.";
+      } else {
+        const context = results.map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`).join("\n\n");
+        sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
+        const respMsgs = [
+          { role: "system", content: "Você é a Sara, analista de dados do negócio. Responda usando APENAS o conteúdo fornecido. Seja direta e cite a fonte. Se não houver dado suficiente, diga." },
+          ...historico.map((h) => ({ role: h.role, content: h.content })),
+          { role: "user", content: `CONTEÚDO:\n${context}\n\nPERGUNTA: ${question}` },
+        ];
+        answer = await askLLM(respMsgs);
+      }
     }
-    const context = results
-      .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
-      .join("\n\n");
-    const sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
-    const prompt = `Você é a Sara, analista de dados do negócio. Responda usando APENAS o conteúdo abaixo. Seja direta e cite a fonte. Se não houver dado suficiente, diga.
 
-CONTEÚDO:
-${context}
+    // Grava a resposta da Sara
+    await supabase.from("chat_messages").insert({
+      company_id: profile.company_id, user_id: user.id, role: "assistant", content: answer,
+    });
 
-PERGUNTA: ${question}
-
-RESPOSTA:`;
-    const answer = await askLLM(prompt);
     return NextResponse.json({ answer, sources });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });

@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
 
 const DOCLING_URL = "http://docling:3002";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 
-// Palavras que indicam pergunta de contagem/agregacao — nesses casos
-// busca semantica nao basta, precisamos do documento inteiro.
+// Palavras que indicam pergunta de contagem/agregacao.
 const AGG_HINTS = [
   "quant", "total", "soma", "quantos", "quantas", "numero de", "número de",
   "media", "média", "maior", "menor", "lista", "liste", "todos", "todas",
@@ -16,58 +16,63 @@ function isAggregation(q: string): boolean {
   return AGG_HINTS.some((h) => low.includes(h));
 }
 
-async function getContext(question: string, department: string | null) {
-  // Pergunta de contagem -> le os documentos inteiros do departamento
-  if (isAggregation(question)) {
-    const listRes = await fetch(`${DOCLING_URL}/list`);
-    const listData = await listRes.json();
-    let files = listData.files || [];
-    if (department) files = files.filter((f: any) => f.department === department);
-
-    const parts: string[] = [];
-    const sources = new Set<string>();
-    for (const f of files.slice(0, 5)) {
-      const url = `${DOCLING_URL}/read?department=${encodeURIComponent(f.department)}&file=${encodeURIComponent(f.file)}`;
-      const r = await fetch(url);
-      const d = await r.json();
-      if (d.content) {
-        parts.push(`[Documento completo — ${f.file} (${f.department})]\n${d.content}`);
-        sources.add(`${f.file} (${f.department})`);
-      }
-    }
-    return { context: parts.join("\n\n"), sources: Array.from(sources) };
-  }
-
-  // Pergunta normal -> busca semantica (12 trechos)
+async function search(question: string, department: string | null, companyId: string, matchCount: number) {
   const searchRes = await fetch(`${DOCLING_URL}/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: question, department: department || null, match_count: 12 }),
+    body: JSON.stringify({
+      query: question,
+      department: department || null,
+      company_id: companyId,
+      match_count: matchCount,
+    }),
   });
   const searchData = await searchRes.json();
-  const results = searchData.results || [];
-  const context = results
-    .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
-    .join("\n\n");
-  const sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
-  return { context, sources };
+  return searchData.results || [];
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const { question, department } = await req.json();
+    // --- Identidade vem da SESSAO, nunca do cliente ---
+    const supabase = await createClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      return NextResponse.json({ error: "não autenticado" }, { status: 401 });
+    }
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("company_id, role, department")
+      .eq("id", user.id)
+      .single();
+    if (!profile) {
+      return NextResponse.json({ error: "perfil não encontrado" }, { status: 403 });
+    }
+
+    const { question, department: reqDept } = await req.json();
     if (!question) {
       return NextResponse.json({ error: "question required" }, { status: 400 });
     }
 
-    const { context, sources } = await getContext(question, department || null);
+    // Membro só enxerga o proprio departamento; admin pode filtrar livremente
+    const department = profile.role === "admin"
+      ? (reqDept || null)
+      : (profile.department || null);
 
-    if (!context) {
+    // Contagem traz mais trechos; busca normal traz 12
+    const matchCount = isAggregation(question) ? 40 : 12;
+    const results = await search(question, department, profile.company_id, matchCount);
+
+    if (!results || results.length === 0) {
       return NextResponse.json({
-        answer: "Não encontrei documentos na base de conhecimento para responder. Verifique se o arquivo foi enviado pelo dashboard.",
+        answer: "Não encontrei documentos na base de conhecimento da sua empresa para responder. Verifique se o arquivo foi enviado pelo dashboard.",
         sources: [],
       });
     }
+
+    const context = results
+      .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
+      .join("\n\n");
+    const sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
 
     const prompt = `Você é a Sara, analista de dados do negócio. Responda à pergunta usando APENAS o conteúdo abaixo, extraído dos documentos reais da empresa. Seja direta e cite números concretos. Quando a pergunta for de contagem, CONTE cuidadosamente os itens listados. Se o conteúdo não permitir responder, diga que não há dado suficiente. Não invente.
 

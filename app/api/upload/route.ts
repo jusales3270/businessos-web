@@ -1,16 +1,35 @@
 import { NextRequest, NextResponse } from "next/server";
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
+import { createClient } from "@/lib/supabase/server";
 
 const DOCLING_URL = "http://docling:3002";
 
 export async function POST(req: NextRequest) {
+  // Identidade da sessao
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "não autenticado" }, { status: 401 });
+  }
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("company_id, role, department")
+    .eq("id", user.id)
+    .single();
+  if (!profile) {
+    return NextResponse.json({ error: "perfil não encontrado" }, { status: 403 });
+  }
+
   const formData = await req.formData();
   const file = formData.get("file") as File;
-  const department = (formData.get("department") as string) || "geral";
+  const reqDept = (formData.get("department") as string) || "geral";
   if (!file) return NextResponse.json({ error: "No file" }, { status: 400 });
 
-  const uploadDir = path.join(process.cwd(), "uploads", department);
+  // Membro só envia para o proprio departamento
+  const department = profile.role === "admin" ? reqDept : (profile.department || "geral");
+
+  const uploadDir = path.join(process.cwd(), "uploads", profile.company_id, department);
   await mkdir(uploadDir, { recursive: true });
 
   const bytes = await file.arrayBuffer();
@@ -23,6 +42,7 @@ export async function POST(req: NextRequest) {
     const fd = new FormData();
     fd.append("file", blob, file.name);
     fd.append("department", department);
+    fd.append("company_id", profile.company_id);
 
     const doclingRes = await fetch(`${DOCLING_URL}/upload`, {
       method: "POST",

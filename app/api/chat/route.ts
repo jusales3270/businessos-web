@@ -3,75 +3,46 @@ import { createClient } from "@/lib/supabase/server";
 
 const DOCLING_URL = "http://docling:3002";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
-
-const MODEL_SEARCH = "deepseek/deepseek-v4-flash";
-const MODEL_COUNT = "google/gemini-3.1-flash-lite";
+const MODEL = "deepseek/deepseek-v4-flash";
 
 const AGG_HINTS = [
   "quant", "total", "soma", "quantos", "quantas", "numero de", "número de",
   "media", "média", "maior", "menor", "lista", "liste", "todos", "todas",
   "por marca", "por modelo", "por tipo", "contagem", "conte",
 ];
-
 function isAggregation(q: string): boolean {
   const low = q.toLowerCase();
   return AGG_HINTS.some((h) => low.includes(h));
 }
 
-async function semanticSearch(question: string, department: string | null, companyId: string) {
-  const res = await fetch(`${DOCLING_URL}/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: question, department: department || null, company_id: companyId, match_count: 12 }),
-  });
-  const data = await res.json();
-  return data.results || [];
-}
-
-async function askLLM(model: string, prompt: string) {
+async function askLLM(prompt: string, jsonMode = false): Promise<string> {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENROUTER_KEY}` },
-    body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], temperature: 0.1 }),
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0,
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+    }),
   });
   const data = await res.json();
-  return data.choices?.[0]?.message?.content || "Erro ao gerar resposta.";
+  return data.choices?.[0]?.message?.content || "";
 }
 
-// Extrai o prefixo do codigo: letras iniciais antes de numero ou hifen.
-// Ex: "TCNC-01" -> "TCNC", "CV5X-1" -> "CV", "CH5X-101" -> "CH"
-function prefixo(codigo: string): string {
-  const m = String(codigo).trim().match(/^([A-Za-z]+)/);
-  return m ? m[1].toUpperCase() : "OUTROS";
-}
-
-// CONTAGEM DETERMINISTICA — feita 100% em codigo, nunca pelo LLM.
-// Retorna um resumo de contagens que o LLM apenas le para responder.
-function acharColunaCodigo(row_data: Record<string, any>): string | null {
-  const chaves = Object.keys(row_data);
-  // procura chave que contenha "cod" (Codigo, Código, codigo...)
-  const porNome = chaves.find((k) => k.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").includes("cod"));
-  if (porNome) return porNome;
-  // fallback: primeira chave
-  return chaves.length > 0 ? chaves[0] : null;
-}
-
-function contarPorPrefixo(rows: any[]): { resumo: string; total: number; detalhe: Record<string, number> } {
-  const contagem: Record<string, number> = {};
-  const colCodigo = rows.length > 0 ? acharColunaCodigo(rows[0].row_data) : null;
-  for (const r of rows) {
-    const codigo = colCodigo ? String(r.row_data[colCodigo] ?? "") : "";
-    const p = prefixo(codigo);
-    contagem[p] = (contagem[p] || 0) + 1;
+// Aplica um filtro estruturado a uma linha. Operadores suportados.
+function matchFilter(value: string, operador: string, alvo: string): boolean {
+  const v = (value ?? "").toString().toLowerCase().trim();
+  const a = (alvo ?? "").toString().toLowerCase().trim();
+  switch (operador) {
+    case "contem": return v.includes(a);
+    case "igual": return v === a;
+    case "comeca_com": return v.startsWith(a);
+    case "termina_com": return v.endsWith(a);
+    case "diferente": return v !== a;
+    case "nao_vazio": return v !== "";
+    default: return v.includes(a);
   }
-  const linhas = Object.entries(contagem)
-    .sort((a, b) => b[1] - a[1])
-    .map(([p, n]) => `${p}: ${n}`);
-  return {
-    resumo: linhas.join("\n"),
-    total: rows.length,
-    detalhe: contagem,
-  };
 }
 
 export async function POST(req: NextRequest) {
@@ -91,10 +62,10 @@ export async function POST(req: NextRequest) {
     if (!question) return NextResponse.json({ error: "question required" }, { status: 400 });
 
     const department = profile.role === "admin" ? (reqDept || null) : (profile.department || null);
-    const counting = isAggregation(question);
 
-    // ---------- MODO CONTAGEM: codigo conta, LLM so redige ----------
-    if (counting) {
+    // ---------- CONTAGEM/AGREGACAO: text-to-filter + contagem em codigo ----------
+    if (isAggregation(question)) {
+      // Busca as linhas da empresa (RLS + filtro explicito)
       let query = supabase
         .from("sheet_rows")
         .select("source_file, department, row_data, row_index")
@@ -102,44 +73,81 @@ export async function POST(req: NextRequest) {
         .order("source_file", { ascending: true })
         .order("row_index", { ascending: true });
       if (department) query = query.eq("department", department);
-
       const { data: rows } = await query;
 
       if (!rows || rows.length === 0) {
         return NextResponse.json({
-          answer: "Não há planilhas estruturadas da sua empresa para contar. Envie uma planilha pelo dashboard.",
+          answer: "Não há planilhas estruturadas da sua empresa. Envie uma planilha pelo dashboard.",
           sources: [],
         });
       }
 
-      // CONTAGEM EXATA EM CODIGO
-      const { resumo, total } = contarPorPrefixo(rows);
+      const colunas = Object.keys(rows[0].row_data);
       const sources = Array.from(new Set(rows.map((r: any) => `${r.source_file} (${r.department})`)));
 
-      // O LLM SO LE OS NUMEROS JA CALCULADOS — nao conta nada.
-      const prompt = `Você é a Sara, analista de dados. A contagem abaixo JÁ FOI CALCULADA com exatidão pelo sistema (não recalcule, não some, não altere os números). Os itens estão agrupados pelo prefixo do código.
+      // PASSO 1: LLM traduz a pergunta em filtros estruturados (nao conta)
+      const filterPrompt = `Você converte perguntas em filtros estruturados para contar linhas de uma planilha. NÃO conte nada, apenas gere o filtro.
 
-CONTAGEM EXATA (calculada pelo sistema):
-${resumo}
-TOTAL GERAL: ${total} itens
+Colunas disponíveis: ${JSON.stringify(colunas)}
 
-Glossário de prefixos (para você interpretar a pergunta):
-- TCNC = Tornos CNC
-- CV = Centros de usinagem Verticais
-- CH = Centros de usinagem Horizontais
-- CT = Centros de Torneamento (Integrex)
-- CV5X / outros = variações
+Amostra de 3 linhas (para entender os valores):
+${rows.slice(0, 3).map((r: any) => JSON.stringify(r.row_data)).join("\n")}
 
-PERGUNTA DO USUÁRIO: ${question}
+Operadores válidos: "contem", "igual", "comeca_com", "termina_com", "diferente", "nao_vazio".
 
-Responda em uma frase, usando EXATAMENTE o número já calculado acima que corresponde à pergunta. Se a pergunta for sobre "tornos CNC", use o número de TCNC. Não invente nem recalcule.`;
+Regra de negócio conhecida: na coluna de código, o prefixo indica o tipo — TCNC=tornos CNC, CV=centros verticais, CH=centros horizontais, CT=centros de torneamento.
 
-      const answer = await askLLM(MODEL_COUNT, prompt);
-      return NextResponse.json({ answer, sources });
+Pergunta: "${question}"
+
+Responda APENAS um JSON com este formato (sem texto extra):
+{"filtros":[{"coluna":"NOME_EXATO_DA_COLUNA","operador":"OPERADOR","valor":"VALOR"}],"descricao":"o que está sendo contado"}
+
+Se a pergunta pede contagem de tudo sem filtro, use "filtros":[]. Combine múltiplos filtros se necessário (todos devem bater - E lógico).`;
+
+      let filtros: any[] = [];
+      let descricao = "itens";
+      try {
+        const raw = await askLLM(filterPrompt, true);
+        const parsed = JSON.parse(raw);
+        filtros = Array.isArray(parsed.filtros) ? parsed.filtros : [];
+        descricao = parsed.descricao || "itens";
+      } catch {
+        filtros = [];
+      }
+
+      // PASSO 2: codigo conta as linhas que batem com TODOS os filtros (deterministico)
+      let contagem = 0;
+      for (const r of rows) {
+        const ok = filtros.every((f) => {
+          const val = r.row_data[f.coluna];
+          if (val === undefined) return false;
+          return matchFilter(String(val), f.operador, f.valor);
+        });
+        if (ok) contagem++;
+      }
+
+      // PASSO 3: LLM apenas redige a resposta com o numero ja calculado
+      const respPrompt = `Você é a Sara, analista de dados. O sistema já contou com exatidão (não recalcule).
+
+Pergunta do usuário: "${question}"
+O que foi contado: ${descricao}
+RESULTADO EXATO calculado pelo sistema: ${contagem}
+Total de linhas na base: ${rows.length}
+
+Responda em uma frase curta e direta, usando exatamente o número ${contagem}.`;
+
+      const answer = await askLLM(respPrompt);
+      return NextResponse.json({ answer, sources, debug: { filtros, contagem } });
     }
 
-    // ---------- MODO BUSCA: RAG qualitativo ----------
-    const results = await semanticSearch(question, department, profile.company_id);
+    // ---------- BUSCA QUALITATIVA: RAG ----------
+    const sres = await fetch(`${DOCLING_URL}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: question, department: department || null, company_id: profile.company_id, match_count: 12 }),
+    });
+    const sdata = await sres.json();
+    const results = sdata.results || [];
     if (results.length === 0) {
       return NextResponse.json({
         answer: "Não encontrei dados na base da sua empresa para responder. Verifique se o arquivo foi enviado pelo dashboard.",
@@ -150,7 +158,6 @@ Responda em uma frase, usando EXATAMENTE o número já calculado acima que corre
       .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
       .join("\n\n");
     const sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
-
     const prompt = `Você é a Sara, analista de dados do negócio. Responda usando APENAS o conteúdo abaixo. Seja direta e cite a fonte. Se não houver dado suficiente, diga.
 
 CONTEÚDO:
@@ -159,8 +166,7 @@ ${context}
 PERGUNTA: ${question}
 
 RESPOSTA:`;
-
-    const answer = await askLLM(MODEL_SEARCH, prompt);
+    const answer = await askLLM(prompt);
     return NextResponse.json({ answer, sources });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });

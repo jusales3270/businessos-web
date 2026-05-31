@@ -47,12 +47,20 @@ function prefixo(codigo: string): string {
 
 // CONTAGEM DETERMINISTICA — feita 100% em codigo, nunca pelo LLM.
 // Retorna um resumo de contagens que o LLM apenas le para responder.
+function acharColunaCodigo(row_data: Record<string, any>): string | null {
+  const chaves = Object.keys(row_data);
+  // procura chave que contenha "cod" (Codigo, Código, codigo...)
+  const porNome = chaves.find((k) => k.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").includes("cod"));
+  if (porNome) return porNome;
+  // fallback: primeira chave
+  return chaves.length > 0 ? chaves[0] : null;
+}
+
 function contarPorPrefixo(rows: any[]): { resumo: string; total: number; detalhe: Record<string, number> } {
   const contagem: Record<string, number> = {};
+  const colCodigo = rows.length > 0 ? acharColunaCodigo(rows[0].row_data) : null;
   for (const r of rows) {
-    // primeira coluna do row_data e o codigo da maquina/item
-    const valores = Object.values(r.row_data);
-    const codigo = valores.length > 0 ? String(valores[0]) : "";
+    const codigo = colCodigo ? String(r.row_data[colCodigo] ?? "") : "";
     const p = prefixo(codigo);
     contagem[p] = (contagem[p] || 0) + 1;
   }

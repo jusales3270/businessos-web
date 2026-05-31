@@ -21,7 +21,7 @@ function isAggregation(q: string): boolean {
 
 // Comprime texto de planilha: remove formatacao redundante de tabela markdown
 function compress(text: string): string {
-  return text
+  const lines = text
     .split("\n")
     .map((line) =>
       line
@@ -32,8 +32,18 @@ function compress(text: string): string {
         .replace(/\s{2,}/g, " ")      // espacos multiplos
         .trim()
     )
-    .filter((line) => line && !/^[-|\s]+$/.test(line)) // remove linhas separadoras (---|---)
-    .join("\n");
+    .filter((line) => line && !/^[-|\s]+$/.test(line)); // remove linhas separadoras
+
+  // Remove linhas duplicadas (overlap entre chunks repete linhas)
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const line of lines) {
+    if (!seen.has(line)) {
+      seen.add(line);
+      unique.push(line);
+    }
+  }
+  return unique.join("\n");
 }
 
 async function semanticSearch(question: string, department: string | null, companyId: string) {

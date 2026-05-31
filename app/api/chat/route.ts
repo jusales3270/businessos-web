@@ -4,7 +4,10 @@ import { createClient } from "@/lib/supabase/server";
 const DOCLING_URL = "http://docling:3002";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 
-// Palavras que indicam pergunta de contagem/agregacao.
+// Modelos: busca normal usa DeepSeek; contagem usa Gemini Flash Lite (rapido em contexto grande)
+const MODEL_SEARCH = "deepseek/deepseek-v4-flash";
+const MODEL_COUNT = "google/gemini-3.1-flash-lite";
+
 const AGG_HINTS = [
   "quant", "total", "soma", "quantos", "quantas", "numero de", "número de",
   "media", "média", "maior", "menor", "lista", "liste", "todos", "todas",
@@ -16,23 +19,33 @@ function isAggregation(q: string): boolean {
   return AGG_HINTS.some((h) => low.includes(h));
 }
 
-// Busca semantica (perguntas normais)
+// Comprime texto de planilha: remove formatacao redundante de tabela markdown
+function compress(text: string): string {
+  return text
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/\s*\|\s*/g, "|")   // tira espacos ao redor dos pipes
+        .replace(/\|+/g, "|")          // colapsa pipes repetidos
+        .replace(/^\|/, "")            // pipe inicial
+        .replace(/\|$/, "")            // pipe final
+        .replace(/\s{2,}/g, " ")      // espacos multiplos
+        .trim()
+    )
+    .filter((line) => line && !/^[-|\s]+$/.test(line)) // remove linhas separadoras (---|---)
+    .join("\n");
+}
+
 async function semanticSearch(question: string, department: string | null, companyId: string) {
   const res = await fetch(`${DOCLING_URL}/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query: question,
-      department: department || null,
-      company_id: companyId,
-      match_count: 12,
-    }),
+    body: JSON.stringify({ query: question, department: department || null, company_id: companyId, match_count: 12 }),
   });
   const data = await res.json();
   return data.results || [];
 }
 
-// Todos os chunks da empresa+departamento (perguntas de contagem)
 async function allChunks(department: string | null, companyId: string) {
   const res = await fetch(`${DOCLING_URL}/chunks`, {
     method: "POST",
@@ -43,47 +56,52 @@ async function allChunks(department: string | null, companyId: string) {
   return data.chunks || [];
 }
 
+async function askLLM(model: string, prompt: string) {
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENROUTER_KEY}` },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+    }),
+  });
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || "Erro ao gerar resposta.";
+}
+
 export async function POST(req: NextRequest) {
   try {
-    // Identidade vem da SESSAO, nunca do cliente
     const supabase = await createClient();
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      return NextResponse.json({ error: "não autenticado" }, { status: 401 });
-    }
+    if (!user) return NextResponse.json({ error: "não autenticado" }, { status: 401 });
+
     const { data: profile } = await supabase
       .from("profiles")
       .select("company_id, role, department")
       .eq("id", user.id)
       .single();
-    if (!profile) {
-      return NextResponse.json({ error: "perfil não encontrado" }, { status: 403 });
-    }
+    if (!profile) return NextResponse.json({ error: "perfil não encontrado" }, { status: 403 });
 
     const { question, department: reqDept } = await req.json();
-    if (!question) {
-      return NextResponse.json({ error: "question required" }, { status: 400 });
-    }
+    if (!question) return NextResponse.json({ error: "question required" }, { status: 400 });
 
-    // Membro só enxerga o proprio departamento; admin filtra livremente
-    const department = profile.role === "admin"
-      ? (reqDept || null)
-      : (profile.department || null);
+    const department = profile.role === "admin" ? (reqDept || null) : (profile.department || null);
 
     let context = "";
     let sources: string[] = [];
+    let model = MODEL_SEARCH;
+    const counting = isAggregation(question);
 
-    if (isAggregation(question)) {
-      // Modo contagem: remonta os documentos inteiros (todos os chunks da empresa)
+    if (counting) {
+      // Modo contagem: todos os chunks, comprimidos, modelo rapido
+      model = MODEL_COUNT;
       const chunks = await allChunks(department, profile.company_id);
       if (chunks.length > 0) {
-        context = chunks
-          .map((c: any) => c.content)
-          .join("\n");
+        context = compress(chunks.map((c: any) => c.content).join("\n"));
         sources = Array.from(new Set(chunks.map((c: any) => `${c.source_file} (${c.department})`)));
       }
     } else {
-      // Modo busca: trechos semanticos
       const results = await semanticSearch(question, department, profile.company_id);
       if (results.length > 0) {
         context = results
@@ -109,21 +127,7 @@ PERGUNTA: ${question}
 
 RESPOSTA:`;
 
-    const llmRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENROUTER_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "deepseek/deepseek-v4-flash",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
-      }),
-    });
-    const llmData = await llmRes.json();
-    const answer = llmData.choices?.[0]?.message?.content || "Erro ao gerar resposta.";
-
+    const answer = await askLLM(model, prompt);
     return NextResponse.json({ answer, sources });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });

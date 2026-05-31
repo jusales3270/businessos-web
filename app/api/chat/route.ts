@@ -16,24 +16,36 @@ function isAggregation(q: string): boolean {
   return AGG_HINTS.some((h) => low.includes(h));
 }
 
-async function search(question: string, department: string | null, companyId: string, matchCount: number) {
-  const searchRes = await fetch(`${DOCLING_URL}/search`, {
+// Busca semantica (perguntas normais)
+async function semanticSearch(question: string, department: string | null, companyId: string) {
+  const res = await fetch(`${DOCLING_URL}/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       query: question,
       department: department || null,
       company_id: companyId,
-      match_count: matchCount,
+      match_count: 12,
     }),
   });
-  const searchData = await searchRes.json();
-  return searchData.results || [];
+  const data = await res.json();
+  return data.results || [];
+}
+
+// Todos os chunks da empresa+departamento (perguntas de contagem)
+async function allChunks(department: string | null, companyId: string) {
+  const res = await fetch(`${DOCLING_URL}/chunks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ company_id: companyId, department: department || null }),
+  });
+  const data = await res.json();
+  return data.chunks || [];
 }
 
 export async function POST(req: NextRequest) {
   try {
-    // --- Identidade vem da SESSAO, nunca do cliente ---
+    // Identidade vem da SESSAO, nunca do cliente
     const supabase = await createClient();
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) {
@@ -53,26 +65,40 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "question required" }, { status: 400 });
     }
 
-    // Membro só enxerga o proprio departamento; admin pode filtrar livremente
+    // Membro só enxerga o proprio departamento; admin filtra livremente
     const department = profile.role === "admin"
       ? (reqDept || null)
       : (profile.department || null);
 
-    // Contagem traz mais trechos; busca normal traz 12
-    const matchCount = isAggregation(question) ? 40 : 12;
-    const results = await search(question, department, profile.company_id, matchCount);
+    let context = "";
+    let sources: string[] = [];
 
-    if (!results || results.length === 0) {
+    if (isAggregation(question)) {
+      // Modo contagem: remonta os documentos inteiros (todos os chunks da empresa)
+      const chunks = await allChunks(department, profile.company_id);
+      if (chunks.length > 0) {
+        context = chunks
+          .map((c: any) => c.content)
+          .join("\n");
+        sources = Array.from(new Set(chunks.map((c: any) => `${c.source_file} (${c.department})`)));
+      }
+    } else {
+      // Modo busca: trechos semanticos
+      const results = await semanticSearch(question, department, profile.company_id);
+      if (results.length > 0) {
+        context = results
+          .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
+          .join("\n\n");
+        sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
+      }
+    }
+
+    if (!context) {
       return NextResponse.json({
         answer: "Não encontrei documentos na base de conhecimento da sua empresa para responder. Verifique se o arquivo foi enviado pelo dashboard.",
         sources: [],
       });
     }
-
-    const context = results
-      .map((r: any, i: number) => `[Trecho ${i + 1} — ${r.source_file} (${r.department})]\n${r.content}`)
-      .join("\n\n");
-    const sources = Array.from(new Set(results.map((r: any) => `${r.source_file} (${r.department})`)));
 
     const prompt = `Você é a Sara, analista de dados do negócio. Responda à pergunta usando APENAS o conteúdo abaixo, extraído dos documentos reais da empresa. Seja direta e cite números concretos. Quando a pergunta for de contagem, CONTE cuidadosamente os itens listados. Se o conteúdo não permitir responder, diga que não há dado suficiente. Não invente.
 
